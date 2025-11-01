@@ -1,185 +1,176 @@
 import os
-import time
 import json
+import time
 import requests
 import pandas as pd
 from datetime import date
 import streamlit as st
 
 # =============================
-# CONFIG
+# Helpers
 # =============================
-OC_PRODUCT = "oddscomparison-prematch"   # v2 pre-match
-OC_VERSION = "v2"
-LANG = "en"
-FMT = "json"
-SPORT_TENNIS_ID = "sr:sport:5"          # Tennis
 
-# ------- util HTTP con reintentos y errores claros -------
-def http_get(url, params, timeout=25, max_tries=3, sleep_sec=0.8):
-    last_exc = None
-    for i in range(max_tries):
+def get_api_key():
+    return st.secrets.get("SPORTDB_API_KEY", os.getenv("SPORTDB_API_KEY", ""))
+
+def safe_get(url, headers=None, params=None, timeout=30, tries=3, sleep=0.6):
+    last = None
+    for _ in range(tries):
         try:
-            r = requests.get(url, params=params, timeout=timeout)
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
             if r.status_code == 200:
-                # intenta JSON, si no, devuelve texto
                 try:
                     return r.json()
                 except Exception:
                     return {"_raw_text": r.text}
             else:
-                # no levantes excepción; regresa dict con error
-                payload = r.text
-                # truncar para UI
-                if payload and len(payload) > 800:
-                    payload = payload[:800] + "... [truncated]"
                 return {
                     "_http_error": True,
-                    "status_code": r.status_code,
+                    "status": r.status_code,
                     "reason": r.reason,
-                    "body": payload
+                    "body": r.text[:1200] + ("... [truncated]" if len(r.text) > 1200 else "")
                 }
         except Exception as e:
-            last_exc = e
-            time.sleep(sleep_sec)
-    # si nunca hubo respuesta válida:
-    return {"_exception": True, "error": str(last_exc)}
+            last = str(e)
+            time.sleep(sleep)
+    return {"_exception": True, "error": last or "unknown"}
 
-def api_key_from_env_or_secrets():
-    return st.secrets.get("SPORTRADAR_API_KEY", os.getenv("SPORTRADAR_API_KEY", ""))
+def normalize_any(json_obj):
+    """Convierte un JSON arbitrario de odds a DataFrame plano.
+       Busca keys típicas como events, fixtures, matches, markets, outcomes, prices, odds."""
+    if json_obj is None:
+        return pd.DataFrame()
 
-def base_url(access_level):
-    return f"https://api.sportradar.com/{OC_PRODUCT}/{access_level}/{OC_VERSION}/{LANG}"
+    # Si ya es lista de eventos:
+    if isinstance(json_obj, list):
+        return pd.json_normalize(json_obj, max_level=1)
 
-@st.cache_data(ttl=30)
-def get_daily_schedule(access_level, api_key, the_date):
-    day = the_date.strftime("%Y-%m-%d")
-    url = f"{base_url(access_level)}/sports/{SPORT_TENNIS_ID}/schedules/{day}/sport_events.{FMT}"
-    return http_get(url, {"api_key": api_key})
+    # Si viene envuelto:
+    for top_key in ["events", "fixtures", "matches", "data", "result", "items", "odds"]:
+        if top_key in json_obj and isinstance(json_obj[top_key], list):
+            return pd.json_normalize(json_obj[top_key], max_level=2)
 
-@st.cache_data(ttl=30)
-def get_sport_event_markets(access_level, api_key, sport_event_id):
-    url = f"{base_url(access_level)}/sport_events/{sport_event_id}/sport_event_markets.{FMT}"
-    return http_get(url, {"api_key": api_key})
+    # Como fallback, normaliza todo el objeto
+    try:
+        return pd.json_normalize(json_obj, max_level=2)
+    except Exception:
+        return pd.DataFrame([json_obj])
 
-def extract_match_winner_prices(markets_json, book_name_substr=None, book_id=None):
-    rows = []
-    if markets_json.get("_http_error") or markets_json.get("_exception"):
-        return rows  # ya se reportará aparte
+def filter_by_bookmaker(df, book_substr):
+    if df.empty or not book_substr:
+        return df
+    cols = [c for c in df.columns if "book" in c.lower() or "bookmaker" in c.lower() or "house" in c.lower()]
+    if not cols:
+        # intenta detectar en columnas anidadas
+        return df
+    mask = False
+    for c in cols:
+        mask = mask | df[c].astype(str).str.contains(book_substr, case=False, na=False)
+    return df[mask]
 
-    markets = markets_json.get("markets", [])
-    target_keys = ("match winner", "match_winner", "moneyline", "2way", "2 way")
-
-    for m in markets:
-        mname = (m.get("name") or "").lower()
-        if not any(k in mname for k in target_keys):
-            continue
-
-        for book in m.get("books", []):
-            b_id = book.get("id")
-            b_name = book.get("name", "")
-
-            if book_id and b_id != book_id:
-                continue
-            if book_name_substr and book_name_substr.lower() not in b_name.lower():
-                continue
-
-            for out in book.get("outcomes", []):
-                dec = (out.get("odds") or {}).get("decimal")
-                if dec is None:
-                    dec = out.get("decimal")
-                am = (out.get("odds") or {}).get("american")
-                if am is None:
-                    am = out.get("american")
-                rows.append({
-                    "bookmaker": b_name,
-                    "outcome": out.get("name"),
-                    "decimal_odds": dec,
-                    "american_odds": am,
-                })
-    return rows
-
-def build_table(schedule_json, access_level, api_key, book_name_substr, book_id=None, max_events=60):
-    rows, errors = [], []
-
-    if schedule_json.get("_http_error") or schedule_json.get("_exception"):
-        return pd.DataFrame(rows), [("schedule", schedule_json)]
-
-    events = schedule_json.get("sport_events", [])
-    for ev in events[:max_events]:
-        se = ev.get("sport_event", {})
-        match_id = se.get("id")
-        comps = se.get("competitors", [])
-        p1 = comps[0]["name"] if len(comps) > 0 else ""
-        p2 = comps[1]["name"] if len(comps) > 1 else ""
-        start_time = se.get("start_time")
-
-        markets = get_sport_event_markets(access_level, api_key, match_id)
-        if markets.get("_http_error") or markets.get("_exception"):
-            errors.append((match_id, markets))
-            continue
-
-        odds = extract_match_winner_prices(markets, book_name_substr=book_name_substr, book_id=book_id)
-        if not odds:
-            rows.append({
-                "match_id": match_id, "start_time": start_time,
-                "player1": p1, "player2": p2,
-                "bookmaker": book_name_substr, "outcome": "",
-                "decimal_odds": "", "american_odds": ""
-            })
-        else:
-            for o in odds:
-                rows.append({
-                    "match_id": match_id, "start_time": start_time,
-                    "player1": p1, "player2": p2,
-                    "bookmaker": o["bookmaker"], "outcome": o["outcome"],
-                    "decimal_odds": o["decimal_odds"], "american_odds": o["american_odds"]
-                })
-
-        time.sleep(0.18)  # conserva margen para el rate limit
-    return pd.DataFrame(rows), errors
+def filter_tennis(df):
+    if df.empty:
+        return df
+    # intenta ubicar columnas con "sport"
+    sport_cols = [c for c in df.columns if "sport" in c.lower() or "category" in c.lower() or "league.sport" in c.lower()]
+    if not sport_cols:
+        return df
+    mask = False
+    for c in sport_cols:
+        mask = mask | df[c].astype(str).str.contains("tennis", case=False, na=False)
+    return df[mask]
 
 # =============================
-# UI
+# Streamlit UI
 # =============================
-st.set_page_config(page_title="Momios Tenis Caliente", page_icon="🎾", layout="wide")
-st.title("🎾 Momios Tenis — Sportradar (filtrado por casa)")
+st.set_page_config(page_title="Tenis — Momios (SportDB.dev)", page_icon="🎾", layout="wide")
+st.title("🎾 Tenis — Momios de Caliente (vía SportDB.dev)")
 
 with st.sidebar:
-    api_key = st.text_input("Sportradar API Key", api_key_from_env_or_secrets(), type="password")
-    access = st.selectbox("Access level", ["trial", "production"])
-    fecha = st.date_input("Fecha", date.today())
-    book_name = st.text_input("Casa (contiene…)", "Caliente",
-                              help="Filtra por coincidencia del nombre. Ej: Caliente, bet365, Pinnacle…")
+    st.subheader("Conexión")
+    base_url = st.text_input(
+        "Base URL",
+        value=os.getenv("SPORTDB_BASE_URL", "https://dashboard.sportdb.dev"),
+        help="Ej.: https://dashboard.sportdb.dev o el host de tu tenant"
+    )
+    endpoint_path = st.text_input(
+        "Ruta del endpoint de odds",
+        value=os.getenv("SPORTDB_ODDS_ENDPOINT", "/api/odds"),
+        help="Ejemplos comunes: /api/odds, /api/tennis/odds, /api/events/odds"
+    )
+    api_key = st.text_input("API Key (SportDB)", value=get_api_key(), type="password")
+    fecha = st.date_input("Fecha", value=date.today())
+    casa = st.text_input("Bookmaker (contiene…)", value="Caliente", help="Filtro por nombre; p. ej. Caliente, bet365…")
     run = st.button("Consultar")
 
+st.caption("Tip: guarda tu API key en *Secrets* como `SPORTDB_API_KEY`.")
+
 if not run:
-    st.info("Ingresa tu API key, escribe 'Caliente' y pulsa Consultar.")
+    st.info("Completa los datos y pulsa **Consultar**.")
     st.stop()
 
 if not api_key:
     st.error("Falta tu API key.")
     st.stop()
 
-with st.spinner(f"Cargando agenda {fecha.isoformat()}…"):
-    schedule = get_daily_schedule(access, api_key, fecha)
+# =============================
+# Llamada al endpoint
+# Convención por defecto: GET {base_url}{endpoint}?sport=tennis&date=YYYY-MM-DD
+# Si tu cuenta usa otros nombres de parámetros (ej. day, from/to), modifica `params` abajo.
+# =============================
+params = {
+    "sport": "tennis",
+    "date": fecha.strftime("%Y-%m-%d"),
+}
+headers = {
+    "Authorization": f"Bearer {api_key}"
+}
 
-table, errs = build_table(schedule, access, api_key, book_name_substr=book_name, book_id=None, max_events=80)
+# Unifica la URL
+endpoint_path = "/" + endpoint_path.lstrip("/")
+url = base_url.rstrip("/") + endpoint_path
+
+with st.spinner(f"Llamando {url} …"):
+    data = safe_get(url, headers=headers, params=params)
+
+# =============================
+# Manejo de errores
+# =============================
+if data.get("_http_error") or data.get("_exception"):
+    st.error("No fue posible obtener datos del endpoint.")
+    st.code(json.dumps(data, indent=2, ensure_ascii=False))
+    st.stop()
+
+# =============================
+# Normalización y filtros
+# =============================
+df = normalize_any(data)
+
+# Si el endpoint devuelve múltiples deportes, filtramos tenis:
+df = filter_tennis(df)
+
+# Filtra por casa: busca columnas típicas (book/bookmaker/house)
+df = filter_by_bookmaker(df, casa)
+
+# Ordena si hay hora/fecha disponibles
+for col in ["start_time", "kickoff", "commence_time", "event_time", "time", "start"]:
+    if col in df.columns:
+        try:
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True).dt.tz_localize(None)
+            df = df.sort_values(col)
+            break
+        except Exception:
+            pass
 
 st.subheader("Resultados")
-if table.empty:
-    st.warning("No hay cuotas 'Match Winner' para esa casa o fecha.")
+if df.empty:
+    st.warning("No se encontraron cuotas con los filtros (revisa endpoint, permisos o el nombre de la casa).")
 else:
-    table = table.sort_values("start_time")
-    st.dataframe(table, use_container_width=True)
-    csv = table.to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Descargar CSV", data=csv, file_name=f"tennis_odds_{book_name}_{fecha.isoformat()}.csv")
+    st.dataframe(df, use_container_width=True)
+    # Descarga
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("⬇️ Descargar CSV", data=csv, file_name=f"tennis_odds_{casa}_{fecha.isoformat()}.csv")
 
-# Debug visible y útil
-if errs or schedule.get("_http_error") or schedule.get("_exception"):
-    st.divider()
-    st.markdown("### ⚠️ Detalles técnicos (debug)")
-    if schedule.get("_http_error") or schedule.get("_exception"):
-        st.write({"schedule_error": schedule})
-    for mid, e in errs:
-        st.write({"match_id": mid, "error": e})
+# Muestra el JSON bruto opcionalmente
+with st.expander("Ver JSON (debug)"):
+    st.code(json.dumps(data, indent=2, ensure_ascii=False))
